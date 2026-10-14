@@ -183,6 +183,250 @@ class ChromaService:
 
         return search_results
 
+    def keyword_search(
+        self,
+        keywords: list[str],
+        filter_dict: Optional[dict[str, Any]] = None,
+    ) -> list[SearchResult]:
+        """Search for documents containing any of the given keywords (exact substring match).
+
+        This provides a keyword-boost layer on top of semantic similarity search.
+        It guarantees that chunks explicitly containing the searched term are always
+        included in results, even when cosine similarity ranks them poorly.
+
+        Works for ANY user-entered word — zero hardcoding required.
+
+        Args:
+            keywords: List of Devanagari words/substrings to look for.
+            filter_dict: Optional metadata filter (e.g., ``{"standard": 8}``).
+
+        Returns:
+            List of ``SearchResult`` objects with score=0.0 (exact match, highest priority).
+        """
+        if not keywords:
+            return []
+
+        store = self._ensure_store()
+        collection = store._collection
+
+        try:
+            # Fetch all docs (with optional standard filter) from ChromaDB
+            get_kwargs: dict[str, Any] = {"include": ["documents", "metadatas"]}
+            if filter_dict:
+                cleaned = {k: v for k, v in filter_dict.items() if v is not None}
+                if len(cleaned) > 1:
+                    get_kwargs["where"] = {"$and": [{k: v} for k, v in cleaned.items()]}
+                elif len(cleaned) == 1:
+                    get_kwargs["where"] = cleaned
+
+            all_data = collection.get(**get_kwargs)
+        except Exception as exc:
+            logger.warning("keyword_search: collection.get() failed: %s", exc)
+            return []
+
+        raw_docs = all_data.get("documents") or []
+        raw_metas = all_data.get("metadatas") or []
+
+        candidates: list[tuple[int, int, SearchResult]] = []
+        seen_cids: set[str] = set()
+
+        num_keywords = len(keywords)
+        for doc_text, meta in zip(raw_docs, raw_metas):
+            matching_kws = [kw for kw in keywords if kw in doc_text]
+            if not matching_kws:
+                continue
+
+            cid = meta.get("chunk_id", doc_text[:50])
+            if cid in seen_cids:
+                continue
+            seen_cids.add(cid)
+
+            match_count = len(matching_kws)
+            total_freq = sum(doc_text.count(kw) for kw in matching_kws)
+
+            # Calibrate score according to keyword coverage:
+            # - If all query keywords match, or single target keyword query matches: score 0.05
+            # - If multiple keywords matched: score scales with coverage (e.g. 0.1 / match_count)
+            # - If weak single match out of multiple keywords: score 0.65
+            if match_count == num_keywords or num_keywords == 1:
+                score = 0.05
+            elif match_count > 1:
+                score = round(0.1 / match_count, 3)
+            else:
+                score = 0.65
+
+            candidates.append((
+                match_count,
+                total_freq,
+                SearchResult(
+                    document=Document(page_content=doc_text, metadata=meta),
+                    score=score,
+                ),
+            ))
+
+        # Rank candidates by multi-term match count descending, then total term frequency descending
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        matched = [c[2] for c in candidates]
+
+        logger.info(
+            "Keyword search for %s returned [green]%d exact-match chunks[/green]",
+            keywords,
+            len(matched),
+            extra={"markup": True},
+        )
+        return matched
+
+    def get_chapter_documents(
+        self,
+        chapter_name: str,
+        standard: Optional[int] = None,
+    ) -> list[SearchResult]:
+        """Retrieve all documents belonging to a chapter, sorted chronologically.
+
+        Extracts all unique chunks for the chapter and orders them by
+        (page_number, chunk_id) to reconstruct the full narrative flow
+        required for chapter summaries and poem explanations.
+
+        Args:
+            chapter_name: Exact chapter name or key phrase to match metadata.
+            standard: Optional standard filter (e.g., 6, 7, 8).
+
+        Returns:
+            List of SearchResult objects sorted chronologically.
+        """
+        store = self._ensure_store()
+        collection = store._collection
+
+        try:
+            where_clauses: list[dict[str, Any]] = [{"chapter": chapter_name}]
+            if standard:
+                where_clauses.append({"standard": int(standard)})
+
+            where = {"$and": where_clauses} if len(where_clauses) > 1 else where_clauses[0]
+            data = collection.get(where=where, include=["documents", "metadatas"])
+        except Exception as exc:
+            logger.warning("get_chapter_documents failed for '%s': %s", chapter_name, exc)
+            return []
+
+        raw_docs = data.get("documents") or []
+        raw_metas = data.get("metadatas") or []
+
+        unique_chunks: dict[str, tuple[int, str, str, dict[str, Any]]] = {}
+        for doc_text, meta in zip(raw_docs, raw_metas):
+            cid = meta.get("chunk_id", doc_text[:50])
+            if cid not in unique_chunks:
+                pg = meta.get("page_number", 0)
+                unique_chunks[cid] = (pg, cid, doc_text, meta)
+
+        sorted_chunks = sorted(unique_chunks.values(), key=lambda x: (x[0], x[1]))
+        results = [
+            SearchResult(
+                document=Document(page_content=doc_text, metadata=meta),
+                score=0.0,
+            )
+            for pg, cid, doc_text, meta in sorted_chunks
+        ]
+        logger.info(
+            "Retrieved %d chronological chunks for chapter '%s' (std=%s)",
+            len(results), chapter_name, standard
+        )
+        return results
+
+    def search_word_context(
+        self,
+        word: str,
+        standard: Optional[int] = None,
+        chapter: Optional[str] = None,
+    ) -> list[SearchResult]:
+        """Search for word meanings, prioritizing glossary sections over chapter context.
+
+        Categorizes matching chunks into:
+        1. Explicit Glossary Matches: chunks containing the word alongside
+           'शब्दार्थ', 'नवीन शब्द', '–', or '-' (highest priority, score 0.05).
+        2. In-Context Chapter Matches: chunks containing the word in sentences (score 0.20).
+
+        Args:
+            word: The target Marathi word or phrase.
+            standard: Optional standard filter.
+            chapter: Optional chapter filter.
+
+        Returns:
+            List of SearchResult objects sorted with glossary definitions first.
+        """
+        if not word or not word.strip():
+            return []
+
+        store = self._ensure_store()
+        collection = store._collection
+
+        clean_word = word.strip()
+        where_clauses: list[dict[str, Any]] = []
+        if standard:
+            where_clauses.append({"standard": int(standard)})
+        if chapter:
+            where_clauses.append({"chapter": chapter})
+
+        get_kwargs: dict[str, Any] = {"include": ["documents", "metadatas"]}
+        if len(where_clauses) > 1:
+            get_kwargs["where"] = {"$and": where_clauses}
+        elif len(where_clauses) == 1:
+            get_kwargs["where"] = where_clauses[0]
+
+        try:
+            data = collection.get(**get_kwargs)
+        except Exception as exc:
+            logger.warning("search_word_context failed: %s", exc)
+            return []
+
+        raw_docs = data.get("documents") or []
+        raw_metas = data.get("metadatas") or []
+
+        glossary_results: list[SearchResult] = []
+        context_results: list[SearchResult] = []
+        seen_cids: set[str] = set()
+
+        _GLOSSARY_INDICATORS = ("शब्दार्थ", "नवीन शब्द", "वाक्प्रचार", "–", "-")
+        search_terms = [clean_word]
+        if " " in clean_word:
+            search_terms.extend([t for t in clean_word.split() if len(t) >= 3])
+
+        for doc_text, meta in zip(raw_docs, raw_metas):
+            matched_terms = [t for t in search_terms if t in doc_text]
+            if not matched_terms:
+                continue
+            cid = meta.get("chunk_id", doc_text[:50])
+            if cid in seen_cids:
+                continue
+            seen_cids.add(cid)
+
+            is_glossary = any(ind in doc_text for ind in _GLOSSARY_INDICATORS)
+            is_explicit_def = is_glossary and any(
+                (f"{t} –" in doc_text or f"{t} -" in doc_text or "शब्दार्थ" in doc_text or "नवीन शब्द" in doc_text)
+                for t in matched_terms
+            )
+            if is_explicit_def:
+                glossary_results.append(
+                    SearchResult(
+                        document=Document(page_content=doc_text, metadata=meta),
+                        score=0.05,
+                    )
+                )
+            else:
+                context_results.append(
+                    SearchResult(
+                        document=Document(page_content=doc_text, metadata=meta),
+                        score=0.20,
+                    )
+                )
+
+        # Glossary hits come first, followed by contextual occurrences
+        matched = glossary_results + context_results
+        logger.info(
+            "Word context search for '%s': %d glossary hits, %d contextual hits",
+            clean_word, len(glossary_results), len(context_results)
+        )
+        return matched
+
     def delete(self, ids: list[str]) -> None:
         """Delete documents from the vector store by ID.
 
